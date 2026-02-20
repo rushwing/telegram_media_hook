@@ -1,101 +1,84 @@
-"""File-based message queue for tracking processed media.
+"""Shared file-based queue for Gateway and MCP server.
 
-Stores a record of fetched Telegram media so that:
-- Items are not re-downloaded on subsequent fetch_telegram_media calls
-- OpenClaw can track which media has been processed by a skill
+Provides atomic read/write helpers with file locking so that
+the Gateway (queue_api) and MCP server processes can safely share
+the same JSON file without data races.
+
+Queue format (telegram_media_queue.json):
+{
+  "pending":   [{"file_id": "...", "message_id": 0, "chat_id": 0,
+                 "caption": "...", "queued_at": "...", "retry_count": 0}],
+  "processed": [{"file_id": "...", ..., "downloaded_at": "...",
+                 "workspace_path": "..."}],
+  "failed":    [{"file_id": "...", ..., "error": "...", "retry_count": 3}]
+}
 """
 
 import json
-import logging
-from datetime import datetime
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
-from dataclasses import dataclass, asdict
+from typing import Generator
+
+from filelock import FileLock
 
 from telegram_media_hook.config import get_config
 
-logger = logging.getLogger(__name__)
+MAX_RETRIES = 3
 
 
-@dataclass
-class QueuedMessage:
-    """A media item in the queue."""
-    id: str
-    timestamp: str
-    chat_id: int
-    user_id: int
-    original_text: str
-    rewritten_text: str
-    media_path: str  # workspace-relative path
-    media_type: str
-    processed: bool = False
+def get_queue_path() -> Path:
+    """Return the path to the queue JSON file."""
+    return get_config().queue_path
 
 
-class MessageQueue:
-    """File-based queue for tracking fetched Telegram media."""
+def _lock_path() -> Path:
+    return get_queue_path().with_suffix(".lock")
 
-    def __init__(self, queue_path: Optional[Path] = None):
-        self.config = get_config()
-        self.queue_path = queue_path or self.config.queue_path
 
-    def _ensure_queue_file(self) -> None:
-        self.queue_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.queue_path.exists():
-            self._write_queue([])
+def _read_raw() -> dict:
+    queue_path = get_queue_path()
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    if not queue_path.exists():
+        return {"pending": [], "processed": [], "failed": []}
+    try:
+        with open(queue_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault("failed", [])
+        return data
+    except (json.JSONDecodeError, IOError):
+        return {"pending": [], "processed": [], "failed": []}
 
-    def _read_queue(self) -> list[dict]:
-        self._ensure_queue_file()
-        try:
-            with open(self.queue_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            return []
 
-    def _write_queue(self, queue: list[dict]) -> None:
-        self.queue_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.queue_path, "w", encoding="utf-8") as f:
-            json.dump(queue, f, ensure_ascii=False, indent=2)
+def _write_raw(queue: dict) -> None:
+    queue_path = get_queue_path()
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(queue_path, "w", encoding="utf-8") as f:
+        json.dump(queue, f, ensure_ascii=False, indent=2)
 
-    def add_message(self, message: QueuedMessage) -> None:
-        """Add a media item to the queue."""
-        queue = self._read_queue()
-        queue.append(asdict(message))
-        self._write_queue(queue)
-        logger.info(f"Queued media: {message.id}")
 
-    def mark_processed(self, message_id: str) -> None:
-        """Mark a media item as processed."""
-        queue = self._read_queue()
-        for msg in queue:
-            if msg["id"] == message_id:
-                msg["processed"] = True
-                break
-        self._write_queue(queue)
+@contextmanager
+def locked_queue() -> Generator[dict, None, None]:
+    """Acquire a file lock, yield the mutable queue dict, then write it back.
 
-    def get_pending_messages(self) -> list[QueuedMessage]:
-        """Return all unprocessed media items."""
-        queue = self._read_queue()
-        return [
-            QueuedMessage(**msg)
-            for msg in queue
-            if not msg.get("processed", False)
-        ]
+    Use this for any read-modify-write operation to prevent data races
+    between the Gateway (queue_api) and MCP server processes.
 
-    def cleanup_processed(self, max_age_hours: int = 24) -> int:
-        """Remove old processed items from the queue."""
-        import time
-        queue = self._read_queue()
-        cutoff = time.time() - (max_age_hours * 3600)
+    Example::
 
-        original_count = len(queue)
-        queue = [
-            msg for msg in queue
-            if not msg.get("processed", False)
-            or datetime.fromisoformat(msg["timestamp"]).timestamp() > cutoff
-        ]
+        with locked_queue() as queue:
+            queue["pending"].append(item)
+    """
+    with FileLock(str(_lock_path())):
+        queue = _read_raw()
+        yield queue
+        _write_raw(queue)
 
-        deleted = original_count - len(queue)
-        if deleted > 0:
-            self._write_queue(queue)
 
-        return deleted
+def read_queue() -> dict:
+    """Read the queue snapshot under a short-held lock.
+
+    Suitable for read-only inspection. The lock is released before returning
+    so callers must not assume the data stays current.
+    """
+    with FileLock(str(_lock_path())):
+        return _read_raw()

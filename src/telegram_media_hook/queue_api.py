@@ -1,78 +1,50 @@
-"""Simple HTTP API for queue management.
+"""HTTP API for queue management.
 
-Gateway can call this API to add file_ids to the queue when receiving media.
+Gateway calls this API to add file_ids to the queue when it receives media.
 """
 
-import asyncio
-import json
-from aiohttp import web
-from pathlib import Path
 from datetime import datetime
 
-from telegram_media_hook.config import get_config
+from aiohttp import web
 
-
-def _get_queue_path() -> Path:
-    config = get_config()
-    return config.workspace_root / "uploads" / "telegram_media_queue.json"
-
-
-def _ensure_queue() -> dict:
-    queue_path = _get_queue_path()
-    queue_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    if not queue_path.exists():
-        return {"pending": [], "processed": []}
-    
-    try:
-        with open(queue_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {"pending": [], "processed": []}
-
-
-def _save_queue(queue: dict) -> None:
-    queue_path = _get_queue_path()
-    queue_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(queue_path, "w", encoding="utf-8") as f:
-        json.dump(queue, f, ensure_ascii=False, indent=2)
+from telegram_media_hook.queue_service import locked_queue, read_queue
 
 
 async def handle_add(request: web.Request) -> web.Response:
-    """Add file_id to queue."""
+    """Add a file_id to the pending queue."""
     try:
         data = await request.json()
     except Exception:
         return web.json_response({"error": "Invalid JSON"}, status=400)
-    
+
     file_id = data.get("file_id")
     if not file_id:
         return web.json_response({"error": "file_id required"}, status=400)
-    
-    queue = _ensure_queue()
-    
-    # Check if already in queue
-    for item in queue.get("pending", []):
-        if item.get("file_id") == file_id:
-            return web.json_response({"ok": True, "message": "Already in queue"})
-    
-    queue.setdefault("pending", []).append({
-        "file_id": file_id,
-        "message_id": data.get("message_id", 0),
-        "chat_id": data.get("chat_id", 0),
-        "caption": data.get("caption", ""),
-        "queued_at": datetime.now().isoformat(),
-    })
-    
-    _save_queue(queue)
-    
+
+    with locked_queue() as queue:
+        for item in queue.get("pending", []):
+            if item.get("file_id") == file_id:
+                return web.json_response({"ok": True, "message": "Already in queue"})
+        queue.setdefault("pending", []).append({
+            "file_id": file_id,
+            "message_id": data.get("message_id", 0),
+            "chat_id": data.get("chat_id", 0),
+            "caption": data.get("caption", ""),
+            "queued_at": datetime.now().isoformat(),
+            "retry_count": 0,
+        })
+
     return web.json_response({"ok": True, "file_id": file_id})
 
 
 async def handle_status(request: web.Request) -> web.Response:
-    """Get queue status."""
-    queue = _ensure_queue()
-    return web.json_response(queue)
+    """Return a summary of the current queue state."""
+    queue = read_queue()
+    return web.json_response({
+        "pending": queue.get("pending", []),
+        "processed_count": len(queue.get("processed", [])),
+        "failed": queue.get("failed", []),
+    })
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -88,7 +60,7 @@ def create_app() -> web.Application:
     return app
 
 
-def run_server(port: int = 8081):
+def run_server(port: int = 8081) -> None:
     """Run the queue API server."""
     app = create_app()
     web.run_app(app, host="127.0.0.1", port=port)

@@ -50,7 +50,7 @@ class Config:
     poll_interval: int = 1
 
     # Queue file for OpenClaw integration
-    queue_file: str = "uploads/message_queue.json"
+    queue_file: str = "uploads/telegram_media_queue.json"
 
     @property
     def upload_path(self) -> Path:
@@ -87,7 +87,7 @@ class Config:
             upload_dir=os.getenv("UPLOAD_DIR", "uploads"),
             max_file_size_mb=int(os.getenv("MAX_FILE_SIZE_MB", "20")),
             poll_interval=int(os.getenv("POLL_INTERVAL", "1")),
-            queue_file=os.getenv("QUEUE_FILE", "uploads/message_queue.json"),
+            queue_file=os.getenv("QUEUE_FILE", "uploads/telegram_media_queue.json"),
         )
 
     def validate(self) -> tuple[bool, Optional[str]]:
