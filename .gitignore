@@ -35,6 +35,9 @@ ENV/
 *.swp
 *.swo
 
+# Claude Code
+.claude/
+
 # Testing
 .coverage
 htmlcov/

@@ -31,8 +31,8 @@ class TelegramClient:
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
 
     def _get_client(self) -> httpx.AsyncClient:
-        """Get HTTP client."""
-        return httpx.AsyncClient(timeout=30.0)
+        """Get HTTP client. Timeout must exceed Telegram's long-poll timeout."""
+        return httpx.AsyncClient(timeout=35.0)
 
     async def get_file(self, file_id: str) -> TelegramFile:
         """Get file info from Telegram.

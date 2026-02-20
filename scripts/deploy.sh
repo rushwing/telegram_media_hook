@@ -1,51 +1,97 @@
 #!/bin/bash
-# Deploy script for telegram_media_hook
+# Deploy telegram-media-hook MCP server to Raspberry Pi.
+#
+# Required env vars:
+#   PI_HOST              SSH target, e.g. pi@raspberrypi.local
+#   TELEGRAM_BOT_TOKEN   Bot token from @BotFather
+#
+# Optional env vars:
+#   OPENCLAW_WORKSPACE   Workspace path on Pi (default: ~/openclaw/workspace)
+#
+# Usage:
+#   PI_HOST=pi@raspberrypi.local \
+#   TELEGRAM_BOT_TOKEN=123:abc \
+#   ./scripts/deploy.sh
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-TARGET_DIR="${OPENCLAW_WORKSPACE:-/home/openclaw/.openclaw/workspace}/telegram_media_hook"
 
-echo "🚀 Deploying telegram_media_hook..."
-
-# Create target directory
-echo "📁 Creating target directory: $TARGET_DIR"
-mkdir -p "$TARGET_DIR"
-
-# Copy source files
-echo "📤 Copying source files..."
-rsync -av --exclude='__pycache__' --exclude='*.pyc' --exclude='.pytest_cache' \
-    "$PROJECT_DIR/src/" "$TARGET_DIR/src/"
-
-# Copy config files
-echo "📤 Copying config files..."
-cp "$PROJECT_DIR/pyproject.toml" "$TARGET_DIR/"
-cp "$PROJECT_DIR/README.md" "$TARGET_DIR/"
-
-# Create uploads directory
-echo "📤 Creating uploads directory..."
-mkdir -p "$TARGET_DIR/uploads"
-
-# Install in workspace venv (if exists)
-if [ -d "$HOME/.openclaw/venv" ]; then
-    echo "🐍 Installing in OpenClaw venv..."
-    source "$HOME/.openclaw/venv/bin/activate"
-    pip install -e "$TARGET_DIR"
-elif [ -d "$PROJECT_DIR/.venv" ]; then
-    echo "🐍 Using project venv..."
-    source "$PROJECT_DIR/.venv/bin/activate"
-    pip install -e "$TARGET_DIR"
-else
-    echo "⚠️  No venv found, skipping pip install"
+# Load .env if present (for TELEGRAM_BOT_TOKEN etc.)
+if [ -f "$PROJECT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$PROJECT_DIR/.env"
+    set +a
 fi
 
+# Validate required vars
+: "${PI_HOST:?PI_HOST is required (e.g. pi@raspberrypi.local)}"
+: "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is required}"
+
+OPENCLAW_WORKSPACE="${OPENCLAW_WORKSPACE:-/home/openclaw/.openclaw/workspace}"
+OPENCLAW_CONFIG="~/.openclaw/openclaw.json"
+
+# Find the latest wheel in dist/
+WHEEL=$(ls "$PROJECT_DIR"/dist/*.whl 2>/dev/null | sort -V | tail -1)
+if [ -z "$WHEEL" ]; then
+    echo "No wheel found in dist/. Run ./scripts/build.sh first."
+    exit 1
+fi
+
+WHEEL_FILE=$(basename "$WHEEL")
+echo "Deploying $WHEEL_FILE → $PI_HOST"
 echo ""
-echo "✅ Deployment complete!"
+
+# ── Step 1: Copy wheel to Pi ──────────────────────────────────────────────────
+echo "[1/3] Copying wheel to Pi..."
+scp "$WHEEL" "$PI_HOST:/tmp/$WHEEL_FILE"
+
+# ── Step 2: Install on Pi via uv tool ────────────────────────────────────────
+echo "[2/3] Installing MCP server on Pi..."
+ssh "$PI_HOST" "uv tool install /tmp/$WHEEL_FILE --force && rm /tmp/$WHEEL_FILE"
+
+# ── Step 3: Register in openclaw.json ────────────────────────────────────────
+echo "[3/3] Registering in openclaw.json..."
+
+# Build the mcpServers entry locally and pipe it safely to the Pi
+MCP_ENTRY=$(python3 - <<PYEOF
+import json
+entry = {
+    "command": "telegram-media-hook-mcp",
+    "env": {
+        "TELEGRAM_BOT_TOKEN": "$TELEGRAM_BOT_TOKEN",
+        "OPENCLAW_WORKSPACE": "$OPENCLAW_WORKSPACE",
+    },
+}
+print(json.dumps(entry))
+PYEOF
+)
+
+ssh "$PI_HOST" "python3 -c \"
+import json, os, sys
+
+entry = json.loads(sys.stdin.read())
+config_path = os.path.expanduser('$OPENCLAW_CONFIG')
+
+if not os.path.exists(config_path):
+    print('openclaw.json not found at', config_path)
+    sys.exit(1)
+
+with open(config_path) as f:
+    config = json.load(f)
+
+config.setdefault('mcpServers', {})['telegram-media'] = entry
+
+with open(config_path, 'w') as f:
+    json.dump(config, f, indent=2)
+
+print('Registered telegram-media in mcpServers')
+\"" <<< "$MCP_ENTRY"
+
 echo ""
-echo "Target: $TARGET_DIR"
+echo "Done. Restart OpenClaw on the Pi to load the MCP server."
 echo ""
-echo "Next steps:"
-echo "1. Set TELEGRAM_BOT_TOKEN environment variable"
-echo "2. Integrate hook with OpenClaw gateway"
-echo "3. Run: python -m telegram_media_hook test"
+echo "To verify the tool is available, ask OpenClaw:"
+echo "  'what MCP tools do you have?'"

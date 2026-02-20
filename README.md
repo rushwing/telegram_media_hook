@@ -1,172 +1,173 @@
-# Telegram Media Hook
+# telegram-media-hook
 
-> Telegram → OpenClaw workspace bridge with Webhook + Async Queue
+MCP server that bridges Telegram media uploads to an OpenClaw workspace.
 
-## Architecture
+When you send a photo or video to your Telegram bot, OpenClaw can call
+`fetch_telegram_media` to download it on demand — no webhook, no public URL,
+no background service.
+
+## How It Works
 
 ```
-Telegram Bot API
-       │
-       ▼ (webhook)
-┌──────────────────┐
-│  Webhook Server  │ ◄── Async processing
-│  (aiohttp)       │
-└────────┬─────────┘
-         │
-         ▼ (queue)
-┌──────────────────┐
-│   JSON Queue     │ ◄── Persistent queue
-└────────┬─────────┘
-         │
-         ▼ (process)
-┌──────────────────┐
-│  Download Media  │ ◄── Save to workspace/uploads/
-└────────┬─────────┘
-         │
-         ▼ (notify)
-┌──────────────────┐
-│  Telegram User  │ ◄── Send confirmation message
-└──────────────────┘
+You upload photo → Telegram bot
+                        │
+             (buffered until fetched)
+                        │
+OpenClaw skill calls fetch_telegram_media()
+                        │
+          MCP server polls Telegram once
+          downloads file → workspace/uploads/
+          returns local file path
+                        │
+        Skill uses path to generate solution
 ```
+
+The MCP server runs as a child process of OpenClaw (stdio transport).
+It starts when OpenClaw starts, sleeps at ~0% CPU when idle, and only
+hits the Telegram API when a skill explicitly calls a tool.
+
+## Prerequisites
+
+- Telegram bot token from [@BotFather](https://t.me/BotFather)
+- OpenClaw running on Raspberry Pi 5 with `uv` installed
+- `uv` installed on your Mac for building
 
 ## Quick Start
 
-### 1. 安装
+### 1. Configure
 
 ```bash
-cd telegram_media_hook
-uv sync
-```
-
-### 2. 配置
-
-```bash
-# 复制 .env.example 到 .env
 cp .env.example .env
-
-# 编辑配置
-nano .env
+# edit .env — set TELEGRAM_BOT_TOKEN and OPENCLAW_WORKSPACE
 ```
 
-### 3. 启动 Webhook 服务器
+### 2. Build
 
 ```bash
-# 启动服务（需要公网访问）
-PYTHONPATH=src python -m telegram_media_hook webhook --port 8080
+./scripts/build.sh
+# produces dist/telegram_media_hook-*.whl
 ```
 
-### 4. 设置 Telegram Webhook
+### 3. Deploy to Pi
 
 ```bash
-# 方式 1: 使用 ngrok（开发用）
-ngrok http 8080
-
-# 方式 2: 购买域名（生产用）
-
-# 设置 webhook
-curl -X POST https://api.telegram.org/bot<TOKEN>/setWebhook \
-  -d url=https://your-public-url/webhook
+PI_HOST=openclaw@raspberrypi.local \
+TELEGRAM_BOT_TOKEN=your-token \
+OPENCLAW_WORKSPACE=/home/openclaw/.openclaw/workspace \
+./scripts/deploy.sh
 ```
 
-## 使用方法
+The deploy script:
+1. Copies the wheel to the Pi via `scp`
+2. Installs it with `uv tool install` (isolated env, available as a command)
+3. Patches `~/.openclaw/openclaw.json` to register the MCP server
 
-### 命令
+### 4. Restart OpenClaw
 
-| 命令 | 说明 |
-|------|------|
-| `webhook` | 启动 webhook 服务器 |
-| `setup-webhook <url>` | 打印设置 webhook 的 curl 命令 |
-| `queue-status` | 查看队列状态 |
-| `test` | 测试配置 |
-| `cleanup` | 清理旧文件 |
+OpenClaw reads `mcpServers` at startup. Restart it on the Pi to pick up
+the new server.
 
-### API 端点
+## MCP Tools
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/webhook` | POST | Telegram 回调 |
-| `/health` | GET | 健康检查 |
-| `/queue` | GET | 队列状态 |
-| `/queue/{id}/retry` | POST | 重试失败任务 |
+| Tool | Description |
+|------|-------------|
+| `fetch_telegram_media()` | Poll Telegram once, download any new media, return file paths |
+| `list_pending_media()` | List fetched media not yet marked as processed |
+| `mark_media_processed(media_id)` | Mark a media item as done |
 
-## Telegram 通知
+### `fetch_telegram_media` response
 
-当图片上传并处理完成后，用户会收到通知：
-
-```
-✅ 图片已保存！
-
-路径: `uploads/20260220_143256_abc123.jpg`
-
-正在生成解答...
-```
-
-## OpenClaw 集成
-
-图片保存后，Skill 可以直接读取：
-
-```python
-# 在你的 SKILL.md 或 skill 代码中
-image_path = "/home/openclaw/.openclaw/workspace/uploads/20260220_143256_abc123.jpg"
-with open(image_path, "rb") as f:
-    image_data = f.read()
+```json
+{
+  "count": 1,
+  "message": "Downloaded 1 media file(s)",
+  "fetched": [
+    {
+      "id": "789012345_a1b2c3d4",
+      "path": "/home/openclaw/.openclaw/workspace/uploads/20260221_143256_a1b2c3d4.jpg",
+      "workspace_path": "uploads/20260221_143256_a1b2c3d4.jpg",
+      "type": "photo",
+      "caption": "solve this"
+    }
+  ]
+}
 ```
 
-## 环境变量
+## openclaw.json
 
-```bash
-TELEGRAM_BOT_TOKEN=your-bot-token
-OPENCLAW_WORKSPACE=/home/openclaw/.openclaw/workspace
-UPLOAD_DIR=uploads
-MAX_FILE_SIZE_MB=20
-WEBHOOK_PORT=8080
-PUBLIC_WEBHOOK_URL=https://your-public-url
-QUEUE_FILE=uploads/webhook_queue.json
+The deploy script adds this automatically. For manual setup:
+
+```json
+{
+  "mcpServers": {
+    "telegram-media": {
+      "command": "telegram-media-hook-mcp",
+      "env": {
+        "TELEGRAM_BOT_TOKEN": "your-token",
+        "OPENCLAW_WORKSPACE": "/home/openclaw/.openclaw/workspace"
+      }
+    }
+  }
+}
 ```
 
-## 项目结构
+## Skill Integration
+
+In your tutor/solver skill, call the MCP tool when the user says they've
+uploaded something:
+
+```
+User: "I sent a photo of the problem, solve it"
+
+→ Call fetch_telegram_media()
+← {count: 1, fetched: [{path: "/home/pi/.../uploads/20260221_..._abc.jpg", type: "photo"}]}
+
+→ Read image at path
+→ Run vision model / solution generator
+→ Call mark_media_processed("789012345_a1b2c3d4")
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TELEGRAM_BOT_TOKEN` | — | Required. Bot token from @BotFather |
+| `OPENCLAW_WORKSPACE` | `/home/openclaw/.openclaw/workspace` | Workspace root on the Pi |
+| `UPLOAD_DIR` | `uploads` | Media save directory (relative to workspace) |
+| `MAX_FILE_SIZE_MB` | `20` | Telegram file size limit |
+| `QUEUE_FILE` | `uploads/message_queue.json` | Queue tracking file (relative to workspace) |
+
+## Project Structure
 
 ```
 telegram_media_hook/
 ├── src/telegram_media_hook/
-│   ├── __init__.py
-│   ├── __main__.py           # CLI
-│   ├── config.py             # 配置
-│   ├── hook.py               # 核心 Hook
-│   ├── telegram_client.py    # Telegram API
-│   ├── file_manager.py       # 文件存储
-│   ├── queue_service.py      # 轮询服务（旧）
-│   └── webhook_server.py     # Webhook 服务器（新）
+│   ├── mcp_server.py       # MCP server — tools exposed to OpenClaw
+│   ├── hook.py             # Core logic — download and save media
+│   ├── telegram_client.py  # Telegram Bot API client
+│   ├── file_manager.py     # File storage in workspace
+│   ├── queue_service.py    # Queue for tracking processed media
+│   ├── config.py           # Configuration from env vars
+│   └── __main__.py         # CLI (test, cleanup, serve)
 ├── scripts/
-│   ├── bridge.sh
-│   └── ...
+│   ├── build.sh            # Build wheel on Mac
+│   └── deploy.sh           # Deploy to Raspberry Pi
 ├── .env.example
-├── pyproject.toml
-└── README.md
+└── pyproject.toml
 ```
 
-## 生产部署建议
+## CLI Commands
 
-1. **使用 PM2 或 Systemd** 运行 webhook 服务器
-2. **配置 SSL**（Telegram 要求 HTTPS）
-3. **使用 Redis** 替代 JSON 文件队列（可选）
-4. **配置日志轮转**
+```bash
+# Test configuration
+telegram-media-hook test
 
-### Systemd 示例
+# Run MCP server manually (normally started by OpenClaw)
+telegram-media-hook serve
 
-```ini
-[Unit]
-Description=Telegram Media Hook
-After=network.target
+# Clean up old uploaded files and queue entries
+telegram-media-hook cleanup --max-age 30
 
-[Service]
-Type=simple
-User=openclaw
-WorkingDirectory=/home/openclaw/.openclaw/workspace/telegram_media_hook
-Environment=PYTHONPATH=src
-ExecStart=/home/openclaw/.openclaw/workspace/telegram_media_hook/.venv/bin/python -m telegram_media_hook webhook --port 8080
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
+# Process a saved update JSON file (for debugging)
+telegram-media-hook process update.json
 ```
