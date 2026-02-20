@@ -1,24 +1,21 @@
 """MCP server for Telegram media hook.
 
-Exposes three tools to OpenClaw:
-  - fetch_telegram_media   poll Telegram once and download any new media
-  - list_pending_media     list fetched-but-unprocessed items in the queue
-  - mark_media_processed   mark a queue item as done
+Gateway → MCP 协作模式：
+1. Gateway 收到图片时，写入 file_id 到队列
+2. MCP 从队列读取并下载图片
+3. Gateway 不需要改动（通过配置文件指定队列路径）
 
-Configure in openclaw.json:
-    {
-      "mcpServers": {
-        "telegram-media": {
-          "command": "telegram-media-hook-mcp",
-          "env": {
-            "TELEGRAM_BOT_TOKEN": "your-token",
-            "OPENCLAW_WORKSPACE": "/path/to/workspace"
-          }
-        }
-      }
-    }
+队列格式 (telegram_media_queue.json):
+{
+  "pending": [
+    {"file_id": "xxx", "message_id": 123, "chat_id": 456, "timestamp": "..."}
+  ],
+  "processed": [...]
+}
 """
 
+import asyncio
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -27,137 +24,173 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from telegram_media_hook.config import get_config
-from telegram_media_hook.hook import TelegramMediaHook
-from telegram_media_hook.queue_service import MessageQueue, QueuedMessage
 
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "telegram-media-hook",
-    instructions="Fetch media uploaded via Telegram bot and save to OpenClaw workspace",
+    instructions="Fetch media uploaded via Telegram bot and save to OpenClaw workspace. Gateway writes file_ids to queue, MCP downloads.",
 )
 
 
-def _offset_path() -> Path:
-    return get_config().upload_path / ".telegram_offset"
+def _get_queue_path() -> Path:
+    """Get the queue file path."""
+    config = get_config()
+    return config.workspace_root / "uploads" / "telegram_media_queue.json"
 
 
-def _read_offset() -> int:
-    path = _offset_path()
-    if path.exists():
-        try:
-            return int(path.read_text().strip())
-        except (ValueError, OSError):
-            pass
-    return 0
+def _ensure_queue() -> dict:
+    """Ensure queue file exists."""
+    queue_path = _get_queue_path()
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    if not queue_path.exists():
+        return {"pending": [], "processed": []}
+    
+    try:
+        with open(queue_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {"pending": [], "processed": []}
 
 
-def _write_offset(offset: int) -> None:
-    path = _offset_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(offset))
+def _save_queue(queue: dict) -> None:
+    """Save queue to file."""
+    queue_path = _get_queue_path()
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(queue_path, "w", encoding="utf-8") as f:
+        json.dump(queue, f, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
 async def fetch_telegram_media() -> dict[str, Any]:
-    """Poll Telegram once for new media uploads and save them to the workspace.
-
-    Call this when the user says they have uploaded a photo or video to the
-    Telegram bot. Returns the local file paths so you can use them immediately.
+    """Poll queue for new media uploads and download them to workspace.
+    
+    Gateway should write file_ids to the queue when receiving media.
+    This tool reads the queue and downloads the files.
     """
     config = get_config()
-    hook = TelegramMediaHook()
-    queue = MessageQueue()
-    client = hook.telegram_client
-
     config.upload_path.mkdir(parents=True, exist_ok=True)
-    offset = _read_offset()
+    
+    queue = _ensure_queue()
+    pending = queue.get("pending", [])
     fetched = []
-
-    async with client._get_client() as http:
-        response = await http.get(
-            f"{client.base_url}/getUpdates",
-            params={"offset": offset, "timeout": 0},
-        )
-        response.raise_for_status()
-        data = response.json()
-
-    if not data.get("ok"):
-        return {"error": data.get("description", "Telegram API error"), "fetched": [], "count": 0}
-
-    for update in data.get("result", []):
-        new_offset = update.get("update_id", 0) + 1
-        if new_offset > offset:
-            offset = new_offset
-
-        result = await hook.handle_update(update)
-        if not result or not result.media_info:
+    
+    if not pending:
+        return {
+            "fetched": [],
+            "count": 0,
+            "message": "No pending media in queue. Make sure Gateway is running.",
+        }
+    
+    # Process each pending item
+    for item in pending:
+        file_id = item.get("file_id")
+        if not file_id:
             continue
-
-        message = update.get("message", {})
-        queued = QueuedMessage(
-            id=f"{update.get('update_id')}_{result.media_info.file_id[:8]}",
-            timestamp=datetime.now().isoformat(),
-            chat_id=message.get("chat", {}).get("id", 0),
-            user_id=message.get("from", {}).get("id", 0),
-            original_text=result.original_message,
-            rewritten_text=result.rewritten_message or "",
-            media_path=result.media_info.workspace_path,
-            media_type=result.media_info.file_type,
-        )
-        queue.add_message(queued)
-
-        fetched.append({
-            "id": queued.id,
-            "path": result.media_info.file_path,
-            "workspace_path": result.media_info.workspace_path,
-            "type": result.media_info.file_type,
-            "caption": result.original_message,
-        })
-
-    _write_offset(offset)
-
+        
+        try:
+            # Download the file
+            from telegram_media_hook.telegram_client import TelegramClient
+            client = TelegramClient()
+            
+            file_info, content = await client.get_file_info(file_id)
+            
+            # Generate filename
+            from telegram_media_hook.file_manager import FileManager
+            file_manager = FileManager()
+            filename = file_manager.generate_filename("photo.jpg")
+            file_path = await file_manager.save_file(content, filename)
+            workspace_path = file_manager.get_workspace_relative_path(file_path)
+            
+            fetched.append({
+                "id": item.get("message_id", file_id[:8]),
+                "file_id": file_id,
+                "path": str(file_path),
+                "workspace_path": workspace_path,
+                "type": "photo",
+                "caption": item.get("caption", ""),
+            })
+            
+            # Move to processed
+            queue["processed"].append({
+                **item,
+                "downloaded_at": datetime.now().isoformat(),
+                "workspace_path": workspace_path,
+            })
+            
+        except Exception as e:
+            logger.error(f"Failed to download {file_id}: {e}")
+            # Keep in pending for retry
+            continue
+    
+    # Remove processed items from pending
+    processed_ids = {item["file_id"] for item in queue.get("processed", []) if "downloaded_at" in item}
+    queue["pending"] = [p for p in pending if p.get("file_id") not in processed_ids]
+    
+    _save_queue(queue)
+    
     return {
         "fetched": fetched,
         "count": len(fetched),
-        "message": f"Downloaded {len(fetched)} media file(s)" if fetched else "No new media found",
+        "message": f"Downloaded {len(fetched)} media file(s)" if fetched else "No files downloaded",
     }
 
 
 @mcp.tool()
 async def list_pending_media() -> dict[str, Any]:
-    """List media files that have been fetched but not yet marked as processed.
-
-    Useful for checking what is waiting if fetch_telegram_media was called
-    in a previous session.
-    """
-    queue = MessageQueue()
-    pending = queue.get_pending_messages()
+    """List media items waiting in the queue."""
+    queue = _ensure_queue()
+    pending = queue.get("pending", [])
+    
     return {
-        "pending": [
-            {
-                "id": m.id,
-                "path": m.media_path,
-                "type": m.media_type,
-                "caption": m.original_text,
-                "timestamp": m.timestamp,
-            }
-            for m in pending
-        ],
+        "pending": pending,
         "count": len(pending),
     }
 
 
 @mcp.tool()
 async def mark_media_processed(media_id: str) -> dict[str, Any]:
-    """Mark a media item as processed after the skill has handled it.
-
-    Args:
-        media_id: The id field returned by fetch_telegram_media or list_pending_media.
-    """
-    queue = MessageQueue()
-    queue.mark_processed(media_id)
+    """Mark a media item as processed (remove from queue)."""
+    queue = _ensure_queue()
+    
+    # Find and remove from pending
+    pending = queue.get("pending", [])
+    queue["pending"] = [p for p in pending if str(p.get("message_id", "")) != media_id]
+    
+    _save_queue(queue)
+    
     return {"ok": True, "media_id": media_id}
+
+
+@mcp.tool()
+async def add_to_queue(file_id: str, message_id: int = 0, chat_id: int = 0, caption: str = "") -> dict[str, Any]:
+    """Manually add a file_id to the queue (for testing or Gateway integration).
+    
+    Args:
+        file_id: Telegram file_id of the media
+        message_id: Optional message ID
+        chat_id: Optional chat ID
+        caption: Optional caption/text with the media
+    """
+    queue = _ensure_queue()
+    
+    # Check if already in queue
+    for item in queue.get("pending", []):
+        if item.get("file_id") == file_id:
+            return {"ok": False, "error": "Already in queue", "file_id": file_id}
+    
+    queue.setdefault("pending", []).append({
+        "file_id": file_id,
+        "message_id": message_id,
+        "chat_id": chat_id,
+        "caption": caption,
+        "queued_at": datetime.now().isoformat(),
+    })
+    
+    _save_queue(queue)
+    
+    return {"ok": True, "file_id": file_id, "message": "Added to queue"}
 
 
 def main() -> None:
