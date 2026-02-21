@@ -6,6 +6,7 @@ Gateway → MCP collaboration:
 3. Gateway needs no changes — the queue path is configured via env.
 """
 
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,29 @@ from telegram_media_hook.config import get_config
 from telegram_media_hook.queue_service import MAX_RETRIES, locked_queue, read_queue
 
 logger = logging.getLogger(__name__)
+
+
+def _get_offset_path() -> Path:
+    return get_config().queue_path.with_name("telegram_poll_offset.json")
+
+
+def _read_offset() -> int:
+    path = _get_offset_path()
+    if not path.exists():
+        return 0
+    try:
+        with open(path) as f:
+            return json.load(f).get("offset", 0)
+    except (json.JSONDecodeError, IOError):
+        return 0
+
+
+def _write_offset(offset: int) -> None:
+    path = _get_offset_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"offset": offset}, f)
+
 
 mcp = FastMCP(
     "telegram-media-hook",
@@ -162,6 +186,108 @@ async def add_to_queue(
             "retry_count": 0,
         })
     return {"ok": True, "file_id": file_id, "message": "Added to queue"}
+
+
+@mcp.tool()
+async def poll_telegram(timeout: int = 5) -> dict[str, Any]:
+    """Fetch new Telegram messages and download any media to workspace.
+
+    Uses getUpdates long-polling — no webhook or public URL required.
+    Safe to call from behind NAT (Raspberry Pi, home network, etc.).
+
+    Args:
+        timeout: Seconds to wait for new messages (0–30). Use 0 for an
+                 immediate check, 5–10 to wait a bit for a pending upload.
+    """
+    from telegram_media_hook.file_manager import FileManager
+    from telegram_media_hook.telegram_client import TelegramClient
+
+    config = get_config()
+    config.upload_path.mkdir(parents=True, exist_ok=True)
+
+    client = TelegramClient()
+    file_manager = FileManager()
+
+    offset = _read_offset()
+    updates = await client.get_updates(offset=offset, timeout=timeout)
+
+    fetched: list[dict] = []
+    new_offset = offset
+
+    for update in updates:
+        update_id = update.get("update_id", 0)
+        new_offset = max(new_offset, update_id + 1)
+
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            continue
+
+        file_id = None
+        file_type = None
+        caption = message.get("caption", "")
+
+        if "photo" in message:
+            file_id = message["photo"][-1].get("file_id")  # largest size
+            file_type = "photo"
+        elif "document" in message:
+            file_id = message["document"].get("file_id")
+            file_type = "document"
+        elif "video" in message:
+            file_id = message["video"].get("file_id")
+            file_type = "video"
+
+        if not file_id:
+            continue
+
+        try:
+            file_info, content = await client.get_file_info(file_id)
+            original_name = (
+                Path(file_info.file_path).name if file_info.file_path else "media"
+            )
+            filename = file_manager.generate_filename(original_name)
+            file_path = await file_manager.save_file(content, filename)
+            workspace_path = file_manager.get_workspace_relative_path(file_path)
+
+            fetched.append({
+                "update_id": update_id,
+                "message_id": message.get("message_id"),
+                "chat_id": message.get("chat", {}).get("id"),
+                "file_id": file_id,
+                "type": file_type,
+                "path": str(file_path),
+                "workspace_path": workspace_path,
+                "caption": caption,
+            })
+        except Exception as e:
+            logger.error(f"Failed to download {file_id}: {e}")
+
+    _write_offset(new_offset)
+
+    return {
+        "fetched": fetched,
+        "count": len(fetched),
+        "message": (
+            f"Downloaded {len(fetched)} media file(s)"
+            if fetched
+            else "No new media messages"
+        ),
+    }
+
+
+@mcp.tool()
+async def delete_webhook() -> dict[str, Any]:
+    """Remove any configured Telegram webhook so getUpdates polling can work.
+
+    Call this once if poll_telegram returns a conflict error.
+    """
+    import httpx
+    config = get_config()
+    async with httpx.AsyncClient(timeout=10.0, proxy=None) as client:
+        response = await client.get(
+            f"https://api.telegram.org/bot{config.bot_token}/deleteWebhook"
+        )
+        data = response.json()
+    return {"ok": data.get("ok"), "description": data.get("description", "")}
 
 
 def main() -> None:

@@ -96,3 +96,27 @@ class TelegramClient:
         file_info = await self.get_file(file_id)
         content = await self.download_file(file_info.file_path)
         return file_info, content
+
+    async def get_updates(self, offset: int = 0, timeout: int = 5) -> list[dict]:
+        """Fetch new updates via long-polling (no public URL required).
+
+        Args:
+            offset: Set to last update_id + 1 to acknowledge processed updates.
+            timeout: Long-poll wait in seconds (0 = return immediately).
+
+        Returns:
+            List of raw Telegram update dicts.
+        """
+        params: dict = {"timeout": timeout, "allowed_updates": ["message"]}
+        if offset:
+            params["offset"] = offset
+
+        # httpx timeout must exceed the long-poll timeout
+        async with httpx.AsyncClient(timeout=timeout + 10.0, proxy=None) as client:
+            response = await client.get(f"{self.base_url}/getUpdates", params=params)
+            response.raise_for_status()
+            data = response.json()
+
+        if not data.get("ok"):
+            raise ValueError(f"Telegram API error: {data.get('description')}")
+        return data.get("result", [])
