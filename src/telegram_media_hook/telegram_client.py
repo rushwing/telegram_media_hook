@@ -32,7 +32,7 @@ class TelegramClient:
 
     def _get_client(self) -> httpx.AsyncClient:
         """Get HTTP client. Timeout must exceed Telegram's long-poll timeout."""
-        return httpx.AsyncClient(timeout=35.0)
+        return httpx.AsyncClient(timeout=35.0, proxy=None)
 
     async def get_file(self, file_id: str) -> TelegramFile:
         """Get file info from Telegram.
